@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -e
+
+CONFIG=/etc/coolhead/coolhead.conf
+PRESETS_FILE=/etc/coolhead/presets.json
+SETTINGS_FILE=/etc/coolhead/settings.json
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+# exit 0 = found, 1 = not found, 2 = file missing or corrupt
+preset_exists() {
+    python3 - "$1" "$PRESETS_FILE" <<'EOF'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        presets = json.load(f)
+    sys.exit(0 if name in presets else 1)
+except FileNotFoundError:
+    sys.exit(2)
+except (json.JSONDecodeError, OSError):
+    sys.exit(2)
+EOF
+}
+
+require_preset() {
+    local name="$1" rc=0
+    preset_exists "$name" || rc=$?
+    if   [ $rc -eq 1 ]; then echo "Unknown preset '$name'. Available: $(list_preset_names | tr '\n' ' ')"; exit 1
+    elif [ $rc -eq 2 ]; then echo "Error: $PRESETS_FILE is missing or corrupted. Try reinstalling coolhead."; exit 1
+    fi
+}
+
+list_preset_names() {
+    python3 - "$PRESETS_FILE" <<'EOF'
+import json, sys
+with open(sys.argv[1]) as f:
+    presets = json.load(f)
+for name in presets:
+    print(name)
+EOF
+}
+
+get_curve_text() {
+    python3 - "$1" "$PRESETS_FILE" <<'EOF'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    presets = json.load(f)
+for row in presets[name]:
+    print(f"{row[0]:>2}  {row[1]:>4}  {row[2]:>4}")
+EOF
+}
+
+save_preset() {
+    # $1=name  $2=tmpfile
+    sudo python3 - "$1" "$2" "$PRESETS_FILE" <<'EOF'
+import json, sys
+
+name, tmpfile, presets_file = sys.argv[1], sys.argv[2], sys.argv[3]
+rows = []
+with open(tmpfile) as f:
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            print(f"Error: expected 3 columns, got: {line}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            rows.append([int(p) for p in parts])
+        except ValueError:
+            print(f"Error: non-integer value in: {line}", file=sys.stderr)
+            sys.exit(1)
+
+if len(rows) < 2:
+    print("Error: curve must have at least 2 entries.", file=sys.stderr)
+    sys.exit(1)
+
+for i, (level, lower, upper) in enumerate(rows):
+    if level not in range(8):
+        print(f"Error: row {i+1}: fan level {level} is invalid (must be 0-7)", file=sys.stderr)
+        sys.exit(1)
+    if lower < 0 or upper < 0:
+        print(f"Error: row {i+1}: temperatures must be non-negative", file=sys.stderr)
+        sys.exit(1)
+    if lower >= upper:
+        print(f"Error: row {i+1}: lower bound ({lower}) must be less than upper bound ({upper})", file=sys.stderr)
+        sys.exit(1)
+
+for i in range(1, len(rows)):
+    if rows[i][1] >= rows[i-1][2]:
+        print(f"Error: row {i+1} lower bound ({rows[i][1]}) must be less than row {i} upper bound ({rows[i-1][2]}) for hysteresis", file=sys.stderr)
+        sys.exit(1)
+
+with open(presets_file) as f:
+    presets = json.load(f)
+presets[name] = rows
+with open(presets_file, 'w') as f:
+    json.dump(presets, f, indent=2)
+print(f"Preset '{name}' saved.")
+EOF
+}
+
+do_edit_preset() {
+    name="$1"
+    tmpfile=$(mktemp /tmp/coolhead-XXXXXX.txt)
+    trap "rm -f '$tmpfile'" EXIT
+
+    {
+        echo "# coolhead preset: $name"
+        echo "# Columns: fan_level  lower_°C  upper_°C"
+        echo "# Fan levels: 0=off, 2≈30%, 3≈40%, 4≈50%, 5≈65%, 7≈90%"
+        echo "# Save and close to apply. Lines starting with # are ignored."
+        echo ""
+        get_curve_text "$name"
+    } > "$tmpfile"
+
+    ${EDITOR:-nano} "$tmpfile"
+    save_preset "$name" "$tmpfile"
+}
+
+restart_if_active() {
+    # Restart the service if the given preset is currently active
+    if [ "$(cat "$CONFIG" 2>/dev/null)" = "$1" ]; then
+        sudo systemctl restart coolhead
+        echo "==> Service restarted to apply changes."
+    fi
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+cmd_set() {
+    preset="$1"
+    require_preset "$preset"
+    echo "$preset" | sudo tee "$CONFIG" > /dev/null
+    sudo systemctl restart coolhead
+    echo "==> Preset set to '$preset'."
+}
+
+cmd_presets() {
+    current=$(cat "$CONFIG" 2>/dev/null || echo "balanced")
+    echo "Available presets:"
+    list_preset_names | while read -r name; do
+        if [ "$name" = "$current" ]; then
+            echo "  * $name (active)"
+        else
+            echo "    $name"
+        fi
+    done
+}
+
+cmd_new() {
+    name="$1"
+    [ -z "$name" ] && { echo "Usage: coolhead new <name>"; exit 1; }
+    local rc=0
+    preset_exists "$name" || rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "Preset '$name' already exists. Use 'coolhead edit $name' to modify it."
+        exit 1
+    elif [ $rc -eq 2 ]; then
+        echo "Error: $PRESETS_FILE is missing or corrupted. Try reinstalling coolhead."
+        exit 1
+    fi
+    # Copy balanced as template
+    sudo python3 - "$name" "$PRESETS_FILE" <<'EOF'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    presets = json.load(f)
+presets[name] = presets["balanced"]
+with open(path, 'w') as f:
+    json.dump(presets, f, indent=2)
+EOF
+    echo "==> Created '$name' from balanced template. Opening editor..."
+    do_edit_preset "$name"
+}
+
+cmd_edit() {
+    name="$1"
+    [ -z "$name" ] && { echo "Usage: coolhead edit <name>"; exit 1; }
+    require_preset "$name"
+    do_edit_preset "$name"
+    restart_if_active "$name"
+}
+
+cmd_delete() {
+    name="$1"
+    [ -z "$name" ] && { echo "Usage: coolhead delete <name>"; exit 1; }
+    require_preset "$name"
+    if [ "$(cat "$CONFIG" 2>/dev/null)" = "$name" ]; then
+        echo "Cannot delete the active preset. Switch to another first."
+        exit 1
+    fi
+    read -rp "Delete preset '$name'? [y/N] " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { echo "==> Aborted."; exit 1; }
+    sudo python3 - "$name" "$PRESETS_FILE" <<'EOF'
+import json, sys
+name, path = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    presets = json.load(f)
+del presets[name]
+with open(path, 'w') as f:
+    json.dump(presets, f, indent=2)
+EOF
+    echo "==> Preset '$name' deleted."
+}
+
+cmd_reset() {
+    name="$1"
+    if [ -z "$name" ] || [ "$name" = "--all" ]; then
+        targets="quiet balanced performance"
+        [ -n "$name" ] || read -rp "Reset all built-in presets to factory defaults? [y/N] " confirm
+        [ -n "$name" ] || [[ ! "$confirm" =~ ^[Yy]$ ]] && [ -z "$name" ] && { echo "==> Aborted."; exit 1; }
+    else
+        targets="$name"
+    fi
+
+    sudo python3 - $targets "$PRESETS_FILE" <<'EOF'
+import json, sys
+
+*names, path = sys.argv[1:]
+
+DEFAULTS = {
+    "quiet":       [[0,0,65],[2,63,72],[3,70,78],[4,76,84],[5,82,90],[7,88,999]],
+    "balanced":    [[0,0,60],[2,58,68],[3,66,75],[4,73,82],[5,80,88],[7,86,999]],
+    "performance": [[0,0,50],[2,48,58],[3,56,65],[4,63,72],[5,70,78],[7,76,999]],
+}
+
+with open(path) as f:
+    presets = json.load(f)
+
+for name in names:
+    if name not in DEFAULTS:
+        print(f"'{name}' is not a built-in preset and cannot be reset.", file=sys.stderr)
+        continue
+    presets[name] = DEFAULTS[name]
+    print(f"Preset '{name}' reset to factory default.")
+
+with open(path, 'w') as f:
+    json.dump(presets, f, indent=2)
+EOF
+
+    active=$(cat "$CONFIG" 2>/dev/null || echo "balanced")
+    for t in $targets; do
+        restart_if_active "$t"
+    done
+}
+
+cmd_config() {
+    subcmd="$1"
+    if [ -z "$subcmd" ]; then
+        echo "Settings ($SETTINGS_FILE):"
+        python3 - "$SETTINGS_FILE" <<'EOF'
+import json, sys
+defaults = {"poll_interval": 10, "window": 3}
+try:
+    with open(sys.argv[1]) as f:
+        settings = {**defaults, **json.load(f)}
+except Exception:
+    settings = defaults
+print(f"  poll_interval  {settings['poll_interval']}s   (seconds between readings)")
+print(f"  window         {settings['window']}    (readings to average — response time = poll_interval × window)")
+EOF
+        return
+    fi
+
+    if [ "$subcmd" = "set" ]; then
+        key="$2"
+        val="$3"
+        [ -z "$key" ] || [ -z "$val" ] && { echo "Usage: coolhead config set <poll_interval|window> <value>"; exit 1; }
+        sudo python3 - "$key" "$val" "$SETTINGS_FILE" <<'EOF'
+import json, sys
+
+key, val, path = sys.argv[1], sys.argv[2], sys.argv[3]
+valid = {"poll_interval", "window"}
+if key not in valid:
+    print(f"Unknown key '{key}'. Valid keys: {', '.join(valid)}", file=sys.stderr)
+    sys.exit(1)
+try:
+    val = int(val)
+    if val < 1:
+        raise ValueError
+except ValueError:
+    print(f"Value must be a positive integer.", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    with open(path) as f:
+        settings = json.load(f)
+except Exception:
+    settings = {}
+settings[key] = val
+with open(path, 'w') as f:
+    json.dump(settings, f, indent=2)
+print(f"==> {key} set to {val}.")
+EOF
+        sudo systemctl restart coolhead
+        echo "==> Service restarted."
+    else
+        echo "Usage: coolhead config [set <key> <value>]"
+    fi
+}
+
+cmd_status() {
+    current=$(cat "$CONFIG" 2>/dev/null || echo "balanced (default)")
+    echo "Preset: $current"
+    echo ""
+    systemctl status coolhead --no-pager
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+case "$1" in
+    set)      cmd_set     "$2" ;;
+    presets)  cmd_presets ;;
+    new)      cmd_new     "$2" ;;
+    edit)     cmd_edit    "$2" ;;
+    delete)   cmd_delete  "$2" ;;
+    reset)    cmd_reset   "$2" ;;
+    config)   cmd_config  "$2" "$3" "$4" ;;
+    status)   cmd_status ;;
+    *)
+        echo "Usage: coolhead <command>"
+        echo ""
+        echo "Presets:"
+        echo "  set <preset>              Switch to a preset and restart the service"
+        echo "  presets                   List all presets"
+        echo "  new <name>                Create a new preset"
+        echo "  edit <name>               Edit a preset in \$EDITOR"
+        echo "  delete <name>             Delete a preset"
+        echo "  reset [<name>|--all]      Reset built-in preset(s) to factory defaults"
+        echo ""
+        echo "Settings:"
+        echo "  config                    Show current settings"
+        echo "  config set poll_interval  Seconds between temperature readings"
+        echo "  config set window         Number of readings to average"
+        echo ""
+        echo "Other:"
+        echo "  status                    Show current preset and service status"
+        ;;
+esac
