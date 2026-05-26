@@ -28,6 +28,7 @@ Fan levels map approximately to: `0`=off, `2`≈30%, `3`≈40%, `4`≈50%, `5`�
 - **Hardware:** ThinkPad (or compatible Lenovo laptop) with the `thinkpad_acpi` kernel module
 - **OS:** Any Linux distribution running systemd with kernel 4.x or newer
 - **Python:** 3.6+
+- **Text Editor (for managing fan curve presets):** `nano` (default) or any editor set via `$EDITOR`
 - `sudo` access
 
 ## Install
@@ -62,6 +63,12 @@ coolhead status                # show active preset and service status
 ```
 
 ### Managing presets
+
+`coolhead edit` opens presets in `$EDITOR`, defaulting to `nano` if not set. To use a different editor:
+
+```bash
+export EDITOR=vim   # add to ~/.bashrc to make permanent
+```
 
 ```bash
 coolhead new <name>            # create a new preset (copied from balanced)
