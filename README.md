@@ -17,11 +17,11 @@ Three built-in presets are included:
 
 | Preset        | Fans off until | Max fan at |
 |---------------|---------------|------------|
-| `quiet`       | 65°C          | 88°C       |
+| `quiet`       | 65°C          | 89°C       |
 | `balanced`    | 60°C          | 86°C       |
 | `performance` | 50°C          | 76°C       |
 
-Fan levels map approximately to: `0`=off, `2`≈30%, `3`≈40%, `4`≈50%, `5`≈65%, `7`≈90%.
+Fan levels map approximately to: `0`=off, `1`≈10%, `2`≈30%, `3`≈40%, `4`≈50%, `5`≈65%, `7`≈90%.
 
 ## Requirements
 
